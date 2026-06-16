@@ -1,74 +1,120 @@
-import base64
+"""
+padel-alpha-clean
+-----------------
+POST /clean  (JSON body)
+
+Limpa o recorte de um PNG transparente para ficar perfeito em peca escura:
+  1) binariza o canal alpha (mata o fringe semitransparente / halo)
+  2) erode opcional (come 1-2px de bordo sujo)
+  3) keyline branco opcional (contorno solido de "sticker" -> some em peca clara,
+     destaca em peca escura, e torna a qualidade do bordo irrelevante)
+  4) re-upload ao ImgBB e devolve {"url": "..."}
+
+Body:
+{
+  "url":       "https://...png",     (obrigatorio) PNG transparente de origem
+  "imgbb_key": "....",               (obrigatorio) chave ImgBB
+  "threshold": 128,                  (opcional) corte do alpha 0-255
+  "erode":     1,                    (opcional) px a comer ao bordo (0 = nenhum)
+  "keyline":   0                     (opcional) px de contorno branco (0 = nenhum)
+}
+
+Resposta: {"url": "https://i.ibb.co/..."}  ou  {"error": "..."}
+"""
+
 import io
+import base64
 
 import requests
+import numpy as np
+import cv2
+from PIL import Image
 from flask import Flask, request, jsonify
-from PIL import Image, ImageFilter
 
 app = Flask(__name__)
 
+Image.MAX_IMAGE_PIXELS = None  # nao abortar em imagens grandes (4096x6144)
 
-@app.get("/")
+
+@app.route("/", methods=["GET"])
 def health():
-    # Render usa isto para o health check; tambem te serve para testar no browser
-    return "ok"
+    return jsonify({"ok": True, "service": "padel-alpha-clean"})
 
 
-@app.post("/clean")
+@app.route("/clean", methods=["POST"])
 def clean():
-    """
-    Recebe JSON:
-      {
-        "url": "<URL do PNG transparente do BiRefNet>",
-        "imgbb_key": "<chave ImgBB>",
-        "threshold": 128,   # opcional: limiar do alfa (0-255)
-        "erode": 1          # opcional: pixeis de borda a aparar (0-3)
-      }
-    Devolve:
-      { "url": "<URL direto do PNG limpo no ImgBB>" }
-    """
+    data = request.get_json(force=True, silent=True) or {}
+    url = data.get("url")
+    imgbb_key = data.get("imgbb_key")
+    threshold = int(data.get("threshold", 128))
+    erode_px = int(data.get("erode", 0))
+    keyline_px = int(data.get("keyline", 0))
+
+    if not url or not imgbb_key:
+        return jsonify({"error": "faltam 'url' e/ou 'imgbb_key'"}), 400
+
+    # 1) download
     try:
-        data = request.get_json(force=True) or {}
-        url = data["url"]
-        imgbb_key = data["imgbb_key"]
-        threshold = int(data.get("threshold", 128))
-        erode = max(0, min(3, int(data.get("erode", 1))))
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": f"download falhou: {e}"}), 502
 
-        # 1) descarregar o PNG do BiRefNet
-        resp = requests.get(url, timeout=120)
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+    try:
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+    except Exception as e:
+        return jsonify({"error": f"abrir imagem falhou: {e}"}), 422
 
-        # 2) binarizar o alfa: cada pixel fica 0% ou 100% transparente (sem meios-tons)
-        r, g, b, a = img.split()
-        a = a.point(lambda v: 255 if v >= threshold else 0)
+    arr = np.array(img)            # H x W x 4 (uint8)
+    del img
+    rgb = arr[:, :, :3]
+    alpha = arr[:, :, 3]
+    del arr
 
-        # 3) erodir N pixeis: encolhe a zona opaca e remove a franja clara das bordas
-        #    (e tambem apaga pequenos pontos isolados)
-        for _ in range(erode):
-            a = a.filter(ImageFilter.MinFilter(3))
+    # 2) binariza alpha -> 0 ou 255
+    opaque = (alpha >= threshold).astype(np.uint8)   # mascara 0/1
+    del alpha
 
-        img.putalpha(a)
+    kernel = np.ones((3, 3), np.uint8)               # iterations = px == raio
 
-        # 4) gravar PNG em memoria
-        buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        b64 = base64.b64encode(buf.getvalue()).decode()
+    # 3) erode (encolhe a regiao opaca, come o bordo sujo)
+    if erode_px > 0:
+        opaque = cv2.erode(opaque, kernel, iterations=erode_px)
 
-        # 5) upload ao ImgBB e devolver o URL direto
+    if keyline_px > 0:
+        outer = cv2.dilate(opaque, kernel, iterations=keyline_px)
+        ring = (outer & (1 - opaque)).astype(bool)   # so o anel novo
+        out_rgb = rgb.copy()
+        out_rgb[ring] = (255, 255, 255)               # pinta o anel a branco
+        out_alpha = (outer * 255).astype(np.uint8)
+        del rgb, outer, ring
+    else:
+        out_rgb = rgb
+        out_alpha = (opaque * 255).astype(np.uint8)
+
+    out = np.dstack([out_rgb, out_alpha])
+    del out_rgb, out_alpha, opaque
+
+    buf = io.BytesIO()
+    Image.fromarray(out, mode="RGBA").save(buf, format="PNG", optimize=False)
+    del out
+    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    del buf
+
+    # 4) upload ImgBB
+    try:
         up = requests.post(
             "https://api.imgbb.com/1/upload",
-            data={"key": imgbb_key, "image": b64, "name": "padel_clean"},
+            data={"key": imgbb_key, "image": png_b64},
             timeout=120,
         )
         up.raise_for_status()
         out_url = up.json()["data"]["url"]
-        return jsonify({"url": out_url})
-
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"upload ImgBB falhou: {e}"}), 502
+
+    return jsonify({"url": out_url})
 
 
 if __name__ == "__main__":
-    import os
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(host="0.0.0.0", port=8000)

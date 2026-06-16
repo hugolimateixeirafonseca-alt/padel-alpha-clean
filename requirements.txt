@@ -1,4 +1,6 @@
-flask
-pillow
-requests
-gunicorn
+Flask==3.0.3
+gunicorn==22.0.0
+requests==2.32.3
+Pillow==10.4.0
+numpy==2.1.1
+opencv-python-headless==4.10.0.84
