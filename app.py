@@ -1,12 +1,12 @@
 """
-padel-alpha-clean  (v3)
------------------------
+padel-alpha-clean  (v4 - memory safe)
+-------------------------------------
 POST /clean  (JSON body)
-Para o pipeline de transparencia nativa (gpt-image-1.5 background=transparent):
-  1) faz upscale alpha-aware (Lanczos, preserva a transparencia) -> resolucao de impressao
-  2) (opcional) endurece o bordo: binariza alpha / erode / keyline branco
-  3) re-upload ao ImgBB
-  4) NOVO: analisa o brilho do design e escolhe a cor de fundo ideal para a montra
+Mesma logica do v3, mas blindado contra OOM (out of memory) na instancia free:
+  - MAX_OUTPUT_PX: limita a resolucao final independentemente do 'scale' pedido,
+    para nunca criar buffers gigantes (era isto que rebentava a memoria).
+  - Upload ao ImgBB via multipart (ficheiro) em vez de base64 string -> menos memoria.
+  - Liberta buffers e forca garbage collection nos pontos criticos.
 Body:
 {
   "url":       "https://...png",   (obrig.) PNG (transparente) de origem
@@ -19,7 +19,7 @@ Body:
 }
 Resposta: {"url": "https://i.ibb.co/...", "showcase_bg": "#ffffff"}  ou  {"error": "..."}
 """
-import io, base64
+import io, gc
 import requests
 import numpy as np
 from PIL import Image
@@ -27,34 +27,50 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 Image.MAX_IMAGE_PIXELS = None
 
+# --- BLINDAGEM DE MEMORIA --------------------------------------------------
+# Lado maximo (px) da imagem final. 4000px chega e sobra para impressao Gelato
+# (estampa ~30cm a >300 DPI). Acima disto, NAO ha ganho de qualidade visivel,
+# so risco de OOM. Ajusta se precisares, mas mantem abaixo de ~4500.
+MAX_OUTPUT_PX = 4000
+# Lado maximo da imagem de ENTRADA antes de processar. Se o PNG de origem ja
+# vier enorme, reduz-se primeiro para nao carregar buffers gigantes a toa.
+MAX_INPUT_PX = 3000
+# ---------------------------------------------------------------------------
+
 
 def pick_showcase_bg(img):
-    """Decide a cor de fundo da montra a partir do brilho do design.
-    Regra: a maioria dos designs tem partes escuras -> fundo branco (look limpo).
-    So quando o design e quase todo claro/brilhante (desapareceria no branco)
-    e que devolve fundo escuro."""
+    """Decide a cor de fundo da montra a partir do brilho do design."""
     try:
         im = img.convert("RGBA")
-        im.thumbnail((200, 200))                     # analisa uma copia pequena (rapido)
+        im.thumbnail((200, 200))
         a = np.asarray(im, dtype=np.float32)
         rgb, alpha = a[..., :3], a[..., 3]
-        mask = alpha > 40                            # ignora pixeis transparentes
+        mask = alpha > 40
         if mask.sum() < 50:
             return "#ffffff"
         lum = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2])[mask]
-        dark_frac = float((lum < 90).mean())         # quanto do design e escuro
-        light_frac = float((lum > 180).mean())       # quanto e muito claro
-        # quase sem partes escuras E muito claro -> branco fa-lo sumir -> fundo escuro
+        dark_frac = float((lum < 90).mean())
+        light_frac = float((lum > 180).mean())
         if dark_frac < 0.06 and light_frac > 0.5:
             return "#1a1a1a"
-        return "#ffffff"                             # caso normal: branco limpo
+        return "#ffffff"
     except Exception:
-        return "#ffffff"                             # fallback seguro
+        return "#ffffff"
+
+
+def _fit_within(w, h, max_side):
+    """Devolve (nw, nh) reduzido para caber em max_side, mantendo o racio.
+    Se ja couber, devolve o tamanho original."""
+    longest = max(w, h)
+    if longest <= max_side:
+        return w, h
+    f = max_side / float(longest)
+    return max(1, round(w * f)), max(1, round(h * f))
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 3})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 4})
 
 
 @app.route("/clean", methods=["POST"])
@@ -76,15 +92,28 @@ def clean():
         img = Image.open(io.BytesIO(r.content)).convert("RGBA")
     except Exception as e:
         return jsonify({"error": f"abrir imagem falhou: {e}"}), 422
+    finally:
+        r = None  # liberta os bytes do download
 
-    # NOVO: decide a cor de fundo da montra ANTES do upscale (analise na imagem pequena)
+    # cor de fundo da montra (na imagem ainda pequena, antes de qualquer upscale)
     showcase_bg = pick_showcase_bg(img)
 
-    # 1) upscale alpha-aware (Lanczos preserva o canal alpha) - ideal para arte flat/vetorial
+    # 0) BLINDAGEM: se a imagem de entrada vier enorme, reduz primeiro
+    iw, ih = _fit_within(img.width, img.height, MAX_INPUT_PX)
+    if (iw, ih) != (img.size):
+        img = img.resize((iw, ih), Image.LANCZOS)
+        gc.collect()
+
+    # 1) upscale alpha-aware (Lanczos), MAS com tecto em MAX_OUTPUT_PX
     if scale and scale != 1.0:
-        nw, nh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
-        img = img.resize((nw, nh), Image.LANCZOS)
-    # 2) endurecimento opcional (so se pedido) - usa numpy/cv2 apenas quando necessario
+        target_w, target_h = round(img.width * scale), round(img.height * scale)
+        # aplica o tecto: nunca passa de MAX_OUTPUT_PX no lado maior
+        target_w, target_h = _fit_within(target_w, target_h, MAX_OUTPUT_PX)
+        if (target_w, target_h) != (img.width, img.height):
+            img = img.resize((max(1, target_w), max(1, target_h)), Image.LANCZOS)
+            gc.collect()
+
+    # 2) endurecimento opcional (so se pedido)
     if threshold > 0 or erode_px > 0 or keyline_px > 0:
         import cv2
         arr = np.array(img); rgb = arr[:, :, :3]; alpha = arr[:, :, 3]; del arr
@@ -102,21 +131,34 @@ def clean():
             out_alpha = (outer * 255).astype(np.uint8)
         else:
             out_rgb = rgb
-            # se binarizou, alpha 0/255; senao mantem o alpha nativo onde e opaco
             out_alpha = (opaque * 255).astype(np.uint8) if threshold > 0 else alpha
         img = Image.fromarray(np.dstack([out_rgb, out_alpha]), mode="RGBA")
+        del rgb, alpha, opaque
+        gc.collect()
 
+    # 3) grava PNG para um buffer e envia ao ImgBB como FICHEIRO (multipart),
+    #    evitando a string base64 gigante (que era ~33% maior que o PNG).
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=False)
-    png_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    del buf, img
+    img = None
+    gc.collect()
+    buf.seek(0)
     try:
-        up = requests.post("https://api.imgbb.com/1/upload",
-                           data={"key": imgbb_key, "image": png_b64}, timeout=120)
+        up = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={"key": imgbb_key},
+            files={"image": ("design.png", buf, "image/png")},
+            timeout=120,
+        )
         up.raise_for_status()
-        return jsonify({"url": up.json()["data"]["url"], "showcase_bg": showcase_bg})
+        out_url = up.json()["data"]["url"]
     except Exception as e:
         return jsonify({"error": f"upload ImgBB falhou: {e}"}), 502
+    finally:
+        buf = None
+        gc.collect()
+
+    return jsonify({"url": out_url, "showcase_bg": showcase_bg})
 
 
 if __name__ == "__main__":
