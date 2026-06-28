@@ -1,5 +1,5 @@
 """
-padel-alpha-clean  (v4 - memory safe)
+padel-alpha-clean  (v6 - memory safe + showcase_bg via garment_set, com "both")
 -------------------------------------
 POST /clean  (JSON body)
 Mesma logica do v3, mas blindado contra OOM (out of memory) na instancia free:
@@ -7,6 +7,8 @@ Mesma logica do v3, mas blindado contra OOM (out of memory) na instancia free:
     para nunca criar buffers gigantes (era isto que rebentava a memoria).
   - Upload ao ImgBB via multipart (ficheiro) em vez de base64 string -> menos memoria.
   - Liberta buffers e forca garbage collection nos pontos criticos.
+  - showcase_bg passa a seguir o garment_set recebido (coerente com a roupa),
+    em vez de adivinhar pela luminosidade do design (que enganava com cores vivas).
 Body:
 {
   "url":       "https://...png",   (obrig.) PNG (transparente) de origem
@@ -15,7 +17,13 @@ Body:
   "threshold": 0,                  (opc.) 0 = NAO binariza (mantem o alpha nativo).
                                           >0 = binariza nesse corte
   "erode":     0,                  (opc.) px a comer ao bordo (so se >0)
-  "keyline":   0                   (opc.) px de contorno branco (so se >0)
+  "keyline":   0,                  (opc.) px de contorno branco (so se >0)
+  "garment_set": "light"           (opc.) "light" ou "dark". Decide a cor de
+                                          fundo da montra de forma coerente com
+                                          a cor da roupa:
+                                            light (roupa clara, design escuro) -> fundo BRANCO
+                                            dark  (roupa escura, design claro) -> fundo ESCURO
+                                          Se ausente, faz fallback a branco.
 }
 Resposta: {"url": "https://i.ibb.co/...", "showcase_bg": "#ffffff"}  ou  {"error": "..."}
 """
@@ -38,24 +46,17 @@ MAX_INPUT_PX = 3000
 # ---------------------------------------------------------------------------
 
 
-def pick_showcase_bg(img):
-    """Decide a cor de fundo da montra a partir do brilho do design."""
-    try:
-        im = img.convert("RGBA")
-        im.thumbnail((200, 200))
-        a = np.asarray(im, dtype=np.float32)
-        rgb, alpha = a[..., :3], a[..., 3]
-        mask = alpha > 40
-        if mask.sum() < 50:
-            return "#ffffff"
-        lum = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2])[mask]
-        dark_frac = float((lum < 90).mean())
-        light_frac = float((lum > 180).mean())
-        if dark_frac < 0.06 and light_frac > 0.5:
-            return "#1a1a1a"
-        return "#ffffff"
-    except Exception:
-        return "#ffffff"
+def pick_showcase_bg(garment_set):
+    """Decide a cor de fundo da montra a partir do garment_set (decisao unica
+    e coerente com a cor da roupa).
+      garment_set = "light" -> roupa clara         -> design escuro -> fundo BRANCO
+      garment_set = "dark"  -> roupa escura         -> design claro  -> fundo ESCURO
+      garment_set = "both"  -> ambas (design vivo)  -> montra sobre   -> fundo ESCURO
+    Qualquer valor desconhecido ou ausente faz fallback a branco (mais seguro)."""
+    gs = (garment_set or "").strip().lower()
+    if gs in ("dark", "both"):
+        return "#1a1a1a"
+    return "#ffffff"
 
 
 def _fit_within(w, h, max_side):
@@ -70,7 +71,7 @@ def _fit_within(w, h, max_side):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 4})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 6})
 
 
 @app.route("/clean", methods=["POST"])
@@ -82,6 +83,7 @@ def clean():
     threshold = int(data.get("threshold", 0))
     erode_px = int(data.get("erode", 0))
     keyline_px = int(data.get("keyline", 0))
+    garment_set = data.get("garment_set", "")
     if not url or not imgbb_key:
         return jsonify({"error": "faltam 'url' e/ou 'imgbb_key'"}), 400
     try:
@@ -95,8 +97,8 @@ def clean():
     finally:
         r = None  # liberta os bytes do download
 
-    # cor de fundo da montra (na imagem ainda pequena, antes de qualquer upscale)
-    showcase_bg = pick_showcase_bg(img)
+    # cor de fundo da montra: segue o garment_set (coerente com a cor da roupa)
+    showcase_bg = pick_showcase_bg(garment_set)
 
     # 0) BLINDAGEM: se a imagem de entrada vier enorme, reduz primeiro
     iw, ih = _fit_within(img.width, img.height, MAX_INPUT_PX)
