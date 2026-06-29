@@ -1,5 +1,5 @@
 """
-padel-alpha-clean  (v6 - memory safe + showcase_bg via garment_set, com "both")
+padel-alpha-clean  (v7 - memory safe + showcase_bg via garment_set, com "both")
 -------------------------------------
 POST /clean  (JSON body)
 Mesma logica do v3, mas blindado contra OOM (out of memory) na instancia free:
@@ -51,10 +51,13 @@ def pick_showcase_bg(garment_set):
     e coerente com a cor da roupa).
       garment_set = "light" -> roupa clara         -> design escuro -> fundo BRANCO
       garment_set = "dark"  -> roupa escura         -> design claro  -> fundo ESCURO
-      garment_set = "both"  -> ambas (design vivo)  -> montra sobre   -> fundo ESCURO
+      garment_set = "both"  -> ambas (ha branco)    -> fundo BRANCO (combina c/ produto claro)
     Qualquer valor desconhecido ou ausente faz fallback a branco (mais seguro)."""
     gs = (garment_set or "").strip().lower()
-    if gs in ("dark", "both"):
+    # Fundo escuro SO quando "dark" (design claro -> so pecas escuras -> nao ha
+    # produto branco). Em "light" e "both" existe produto branco/claro, por isso
+    # a montra usa fundo BRANCO para combinar (evita montra preta sobre t-shirt branca).
+    if gs == "dark":
         return "#1a1a1a"
     return "#ffffff"
 
@@ -71,7 +74,7 @@ def _fit_within(w, h, max_side):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 6})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 7})
 
 
 @app.route("/clean", methods=["POST"])
