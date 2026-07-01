@@ -1,5 +1,5 @@
 """
-padel-alpha-clean (v17 - product-specific safe canvases + larger fit + alpha bbox threshold)
+padel-alpha-clean (v18 - faster parallel ImgBB uploads + timeout-safe /clean)
 -------------------------------------------------------
 This version solves Gelato size/cropping problems by returning a different
 transparent PNG per product/template.
@@ -32,6 +32,7 @@ import gc
 import time
 import requests
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 from flask import Flask, request, jsonify
 
@@ -165,6 +166,29 @@ def _upload_imgbb(img, imgbb_key, filename="design.png"):
         gc.collect()
 
 
+def _img_to_png_bytes(img):
+    buf = io.BytesIO()
+    # compress_level 4 is a good speed/size balance for Make/Render timeouts.
+    img.save(buf, format="PNG", optimize=False, compress_level=4)
+    return buf.getvalue()
+
+
+def _upload_imgbb_bytes(payload, imgbb_key, filename="design.png", timeout=90):
+    buf = io.BytesIO(payload)
+    try:
+        up = requests.post(
+            "https://api.imgbb.com/1/upload",
+            data={"key": imgbb_key},
+            files={"image": (filename, buf, "image/png")},
+            timeout=timeout,
+        )
+        up.raise_for_status()
+        return up.json()["data"]["url"]
+    finally:
+        buf = None
+        gc.collect()
+
+
 def _apply_alpha_ops(img, threshold=0, erode_px=0, keyline_px=0):
     if threshold <= 0 and erode_px <= 0 and keyline_px <= 0:
         return img
@@ -199,7 +223,7 @@ def _apply_alpha_ops(img, threshold=0, erode_px=0, keyline_px=0):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 17})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 18})
 
 
 @app.route("/clean", methods=["POST"])
@@ -210,6 +234,12 @@ def clean():
     imgbb_key = data.get("imgbb_key")
     garment_set = data.get("garment_set", "")
     scale = float(data.get("scale", 1))
+    max_output_px = int(data.get("max_output_px", MAX_OUTPUT_PX))
+    max_output_px = min(max(max_output_px, 2000), MAX_OUTPUT_PX)
+    parallel_uploads = int(data.get("parallel_uploads", 3))
+    parallel_uploads = min(max(parallel_uploads, 1), 4)
+    upload_timeout = int(data.get("upload_timeout", 90))
+    upload_timeout = min(max(upload_timeout, 30), 120)
     threshold = int(data.get("threshold", 0))
     erode_px = int(data.get("erode", 0))
     keyline_px = int(data.get("keyline", 0))
@@ -256,7 +286,7 @@ def clean():
         img = _fit_artwork_to_product_canvas(base, profile, alpha_threshold=bbox_alpha_threshold)
         if scale and scale != 1.0:
             tw, th = round(img.width * scale), round(img.height * scale)
-            tw, th = _fit_within(tw, th, MAX_OUTPUT_PX)
+            tw, th = _fit_within(tw, th, max_output_px)
             if (tw, th) != img.size:
                 img = img.resize((tw, th), Image.LANCZOS)
         out_url = _upload_imgbb(img, imgbb_key, filename=f"{product_key}.png")
@@ -269,6 +299,9 @@ def clean():
     result = {"showcase_bg": showcase_bg}
     first_url = None
 
+    # Prepare PNG payloads locally first, then upload to ImgBB concurrently.
+    # This avoids Make HTTP timeout when 6-8 product-specific PNGs are uploaded sequentially.
+    payloads = []
     for key, raw_profile in outputs.items():
         profile = DEFAULT_PROFILES.get(key, {})
         merged = dict(profile)
@@ -279,22 +312,41 @@ def clean():
 
         if scale and scale != 1.0:
             tw, th = round(img.width * scale), round(img.height * scale)
-            tw, th = _fit_within(tw, th, MAX_OUTPUT_PX)
+            tw, th = _fit_within(tw, th, max_output_px)
             if (tw, th) != img.size:
                 img = img.resize((tw, th), Image.LANCZOS)
 
         try:
-            out_url = _upload_imgbb(img, imgbb_key, filename=f"{key}.png")
+            payloads.append((key, _img_to_png_bytes(img)))
         except Exception as e:
-            return jsonify({"error": f"upload ImgBB falhou para {key}: {e}"}), 502
+            return jsonify({"error": f"gerar PNG falhou para {key}: {e}"}), 500
+        finally:
+            img = None
+            gc.collect()
 
-        result[f"url_{key}"] = out_url
-        if first_url is None:
-            first_url = out_url
-
-        img = None
+    try:
+        with ThreadPoolExecutor(max_workers=parallel_uploads) as ex:
+            futs = {
+                ex.submit(_upload_imgbb_bytes, payload, imgbb_key, f"{key}.png", upload_timeout): key
+                for key, payload in payloads
+            }
+            for fut in as_completed(futs):
+                key = futs[fut]
+                try:
+                    out_url = fut.result()
+                except Exception as e:
+                    return jsonify({"error": f"upload ImgBB falhou para {key}: {e}"}), 502
+                result[f"url_{key}"] = out_url
+    finally:
+        payloads = None
         gc.collect()
-        time.sleep(0.15)
+
+    # Keep a stable first URL preference.
+    for key in outputs.keys():
+        out_url = result.get(f"url_{key}")
+        if out_url:
+            first_url = out_url
+            break
 
     # Backwards-compatible aliases.
     if "url_tshirt_classic" in result:
