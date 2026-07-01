@@ -1,5 +1,5 @@
 """
-padel-alpha-clean  (v11 - memory safe + auto-trim + controlled padding)
+padel-alpha-clean  (v12 - memory safe + auto-trim + safe margin no crop)
 ----------------------------------------------------------------------------
 POST /clean  (JSON body)
 Limpa/upscale um PNG transparente e devolve um showcase_bg coerente com o
@@ -16,14 +16,14 @@ Body:
   "keyline": 0,
   "garment_set": "light" | "dark",
   "auto_trim": true,
-  "padding_pct": 6
+  "padding_pct": 12
 }
 
 Regras visuais:
 - garment_set = light -> fundo BRANCO
 - garment_set = dark  -> fundo ESCURO
 - auto_trim = true    -> corta transparencia exterior e reaplica padding
-- padding_pct         -> margem final (% do lado maior do conteudo), recomendado 5-8
+- padding_pct         -> margem final (% do lado maior do conteudo), recomendado 10-14 para evitar cortes
 """
 import io, gc
 import requests
@@ -36,7 +36,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 MAX_OUTPUT_PX = 4000
 MAX_INPUT_PX = 3000
-DEFAULT_PADDING_PCT = 6.0
+DEFAULT_PADDING_PCT = 12.0
 
 
 def pick_showcase_bg(garment_set):
@@ -81,7 +81,7 @@ def _trim_and_pad(img, padding_pct=DEFAULT_PADDING_PCT, alpha_threshold=1):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 11})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 12})
 
 
 @app.route("/clean", methods=["POST"])
