@@ -1,5 +1,5 @@
 """
-padel-alpha-clean  (v12 - memory safe + auto-trim + safe margin no crop)
+padel-alpha-clean  (v13 - vertical safe fit + side padding control)
 ----------------------------------------------------------------------------
 POST /clean  (JSON body)
 Limpa/upscale um PNG transparente e devolve um showcase_bg coerente com o
@@ -16,14 +16,18 @@ Body:
   "keyline": 0,
   "garment_set": "light" | "dark",
   "auto_trim": true,
-  "padding_pct": 12
+  "padding_pct": 12,
+  "padding_x_pct": 18,
+  "padding_y_pct": 10
 }
 
 Regras visuais:
 - garment_set = light -> fundo BRANCO
 - garment_set = dark  -> fundo ESCURO
 - auto_trim = true    -> corta transparencia exterior e reaplica padding
-- padding_pct         -> margem final (% do lado maior do conteudo), recomendado 10-14 para evitar cortes
+- padding_pct         -> margem uniforme de fallback (%)
+- padding_x_pct       -> margem horizontal (%), recomendado 16-20 para evitar corte lateral
+- padding_y_pct       -> margem vertical (%), recomendado 8-12
 """
 import io, gc
 import requests
@@ -37,6 +41,8 @@ Image.MAX_IMAGE_PIXELS = None
 MAX_OUTPUT_PX = 4000
 MAX_INPUT_PX = 3000
 DEFAULT_PADDING_PCT = 12.0
+DEFAULT_PADDING_X_PCT = 18.0
+DEFAULT_PADDING_Y_PCT = 10.0
 
 
 def pick_showcase_bg(garment_set):
@@ -63,7 +69,7 @@ def _alpha_bbox(img, alpha_threshold=1):
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
-def _trim_and_pad(img, padding_pct=DEFAULT_PADDING_PCT, alpha_threshold=1):
+def _trim_and_pad(img, padding_pct=DEFAULT_PADDING_PCT, padding_x_pct=None, padding_y_pct=None, alpha_threshold=1):
     bbox = _alpha_bbox(img, alpha_threshold=alpha_threshold)
     if bbox is None:
         return img
@@ -71,17 +77,22 @@ def _trim_and_pad(img, padding_pct=DEFAULT_PADDING_PCT, alpha_threshold=1):
     cropped = img.crop((left, top, right, bottom))
     cw, ch = cropped.size
     longest = max(cw, ch)
-    pad = max(1, round(longest * max(0.0, float(padding_pct)) / 100.0))
-    new_w = cw + pad * 2
-    new_h = ch + pad * 2
+    if padding_x_pct is None:
+        padding_x_pct = padding_pct
+    if padding_y_pct is None:
+        padding_y_pct = padding_pct
+    pad_x = max(1, round(longest * max(0.0, float(padding_x_pct)) / 100.0))
+    pad_y = max(1, round(longest * max(0.0, float(padding_y_pct)) / 100.0))
+    new_w = cw + pad_x * 2
+    new_h = ch + pad_y * 2
     out = Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
-    out.paste(cropped, (pad, pad), cropped)
+    out.paste(cropped, (pad_x, pad_y), cropped)
     return out
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 12})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 13})
 
 
 @app.route("/clean", methods=["POST"])
@@ -99,7 +110,17 @@ def clean():
         padding_pct = float(data.get("padding_pct", DEFAULT_PADDING_PCT))
     except Exception:
         padding_pct = DEFAULT_PADDING_PCT
-    padding_pct = min(max(padding_pct, 0.0), 20.0)
+    padding_pct = min(max(padding_pct, 0.0), 24.0)
+    try:
+        padding_x_pct = float(data.get("padding_x_pct", padding_pct if "padding_pct" in data else DEFAULT_PADDING_X_PCT))
+    except Exception:
+        padding_x_pct = DEFAULT_PADDING_X_PCT
+    try:
+        padding_y_pct = float(data.get("padding_y_pct", padding_pct if "padding_pct" in data else DEFAULT_PADDING_Y_PCT))
+    except Exception:
+        padding_y_pct = DEFAULT_PADDING_Y_PCT
+    padding_x_pct = min(max(padding_x_pct, 0.0), 30.0)
+    padding_y_pct = min(max(padding_y_pct, 0.0), 24.0)
 
     if not url or not imgbb_key:
         return jsonify({"error": "faltam 'url' e/ou 'imgbb_key'"}), 400
@@ -124,7 +145,7 @@ def clean():
 
     # Auto-trim antes do upscale para reduzir espaco transparente e ganhar escala visual
     if auto_trim:
-        img = _trim_and_pad(img, padding_pct=padding_pct, alpha_threshold=1)
+        img = _trim_and_pad(img, padding_pct=padding_pct, padding_x_pct=padding_x_pct, padding_y_pct=padding_y_pct, alpha_threshold=1)
         gc.collect()
 
     if scale and scale != 1.0:
@@ -162,7 +183,7 @@ def clean():
 
     # Segunda passagem opcional de trim muito leve apos keyline/erode, para garantir margens consistentes
     if auto_trim:
-        img = _trim_and_pad(img, padding_pct=padding_pct, alpha_threshold=1)
+        img = _trim_and_pad(img, padding_pct=padding_pct, padding_x_pct=padding_x_pct, padding_y_pct=padding_y_pct, alpha_threshold=1)
         gc.collect()
 
     buf = io.BytesIO()
