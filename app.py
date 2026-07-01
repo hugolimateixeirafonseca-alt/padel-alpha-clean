@@ -1,5 +1,5 @@
 """
-padel-alpha-clean  (v13 - vertical safe fit + side padding control)
+padel-alpha-clean  (v14 - extra safe margins for mockup crop avoidance)
 ----------------------------------------------------------------------------
 POST /clean  (JSON body)
 Limpa/upscale um PNG transparente e devolve um showcase_bg coerente com o
@@ -16,9 +16,9 @@ Body:
   "keyline": 0,
   "garment_set": "light" | "dark",
   "auto_trim": true,
-  "padding_pct": 12,
-  "padding_x_pct": 18,
-  "padding_y_pct": 10
+  "padding_pct": 14,
+  "padding_x_pct": 22,
+  "padding_y_pct": 14
 }
 
 Regras visuais:
@@ -26,8 +26,8 @@ Regras visuais:
 - garment_set = dark  -> fundo ESCURO
 - auto_trim = true    -> corta transparencia exterior e reaplica padding
 - padding_pct         -> margem uniforme de fallback (%)
-- padding_x_pct       -> margem horizontal (%), recomendado 16-20 para evitar corte lateral
-- padding_y_pct       -> margem vertical (%), recomendado 8-12
+- padding_x_pct       -> margem horizontal (%), recomendado 20-24 para evitar corte lateral
+- padding_y_pct       -> margem vertical (%), recomendado 12-16
 """
 import io, gc
 import requests
@@ -40,9 +40,9 @@ Image.MAX_IMAGE_PIXELS = None
 
 MAX_OUTPUT_PX = 4000
 MAX_INPUT_PX = 3000
-DEFAULT_PADDING_PCT = 12.0
-DEFAULT_PADDING_X_PCT = 18.0
-DEFAULT_PADDING_Y_PCT = 10.0
+DEFAULT_PADDING_PCT = 14.0
+DEFAULT_PADDING_X_PCT = 22.0
+DEFAULT_PADDING_Y_PCT = 14.0
 
 
 def pick_showcase_bg(garment_set):
@@ -92,7 +92,7 @@ def _trim_and_pad(img, padding_pct=DEFAULT_PADDING_PCT, padding_x_pct=None, padd
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 13})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 14})
 
 
 @app.route("/clean", methods=["POST"])
