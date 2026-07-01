@@ -1,5 +1,5 @@
 """
-padel-alpha-clean (v16 - product-specific safe canvases)
+padel-alpha-clean (v17 - product-specific safe canvases + larger fit + alpha bbox threshold)
 -------------------------------------------------------
 This version solves Gelato size/cropping problems by returning a different
 transparent PNG per product/template.
@@ -20,6 +20,7 @@ Recommended /clean body:
   "garment_set": "light",
   "multi_output": true,
   "fit_to_canvas": true,
+  "bbox_alpha_threshold": 16,
   "outputs": {
     "tshirt_classic": {"target_aspect": 0.667, "max_art_width_pct": 74, "max_art_height_pct": 86},
     "tshirt_performance": {"target_aspect": 0.724, "max_art_width_pct": 72, "max_art_height_pct": 84}
@@ -40,61 +41,7 @@ Image.MAX_IMAGE_PIXELS = None
 MAX_OUTPUT_PX = 4000
 MAX_INPUT_PX = 3000
 
-DEFAULT_PROFILES = {
-    # Target aspects calibrated from Gelato design boxes supplied by Hugo.
-    # width/height examples:
-    # classic tee 258/387.02=0.667; performance 256/353.73=0.724;
-    # hoodie 201/264.67=0.759; tank 212/283.22=0.749;
-    # jersey 240/355.28=0.676; mug 56/77.3=0.724.
-    "tshirt_classic": {
-        "target_aspect": 0.667,
-        "max_art_width_pct": 74,
-        "max_art_height_pct": 86,
-        "max_art_upscale": 4.0,
-    },
-    "tshirt_performance": {
-        "target_aspect": 0.724,
-        "max_art_width_pct": 72,
-        "max_art_height_pct": 84,
-        "max_art_upscale": 4.0,
-    },
-    "hoodie": {
-        "target_aspect": 0.759,
-        "max_art_width_pct": 66,
-        "max_art_height_pct": 78,
-        "max_art_upscale": 4.0,
-    },
-    "sweatshirt": {
-        "target_aspect": 0.759,
-        "max_art_width_pct": 66,
-        "max_art_height_pct": 78,
-        "max_art_upscale": 4.0,
-    },
-    "mug": {
-        "target_aspect": 0.724,
-        "max_art_width_pct": 86,
-        "max_art_height_pct": 90,
-        "max_art_upscale": 4.0,
-    },
-    "racerback_tank": {
-        "target_aspect": 0.749,
-        "max_art_width_pct": 62,
-        "max_art_height_pct": 74,
-        "max_art_upscale": 4.0,
-    },
-    "performance_woman_tank": {
-        "target_aspect": 0.749,
-        "max_art_width_pct": 64,
-        "max_art_height_pct": 76,
-        "max_art_upscale": 4.0,
-    },
-    "unisex_sports_jersey": {
-        "target_aspect": 0.676,
-        "max_art_width_pct": 72,
-        "max_art_height_pct": 84,
-        "max_art_upscale": 4.0,
-    },
-}
+DEFAULT_PROFILES = {"tshirt_classic": {"target_aspect": 0.667, "max_art_width_pct": 88, "max_art_height_pct": 93, "max_art_upscale": 8.0}, "tshirt_performance": {"target_aspect": 0.724, "max_art_width_pct": 88, "max_art_height_pct": 92, "max_art_upscale": 8.0}, "hoodie": {"target_aspect": 0.759, "max_art_width_pct": 82, "max_art_height_pct": 88, "max_art_upscale": 8.0}, "sweatshirt": {"target_aspect": 0.759, "max_art_width_pct": 84, "max_art_height_pct": 90, "max_art_upscale": 8.0}, "mug": {"target_aspect": 0.724, "max_art_width_pct": 94, "max_art_height_pct": 95, "max_art_upscale": 8.0}, "racerback_tank": {"target_aspect": 0.749, "max_art_width_pct": 78, "max_art_height_pct": 84, "max_art_upscale": 8.0}, "performance_woman_tank": {"target_aspect": 0.749, "max_art_width_pct": 80, "max_art_height_pct": 86, "max_art_upscale": 8.0}, "unisex_sports_jersey": {"target_aspect": 0.676, "max_art_width_pct": 88, "max_art_height_pct": 93, "max_art_upscale": 8.0}}
 
 
 def pick_showcase_bg(garment_set):
@@ -252,7 +199,7 @@ def _apply_alpha_ops(img, threshold=0, erode_px=0, keyline_px=0):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 16})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 17})
 
 
 @app.route("/clean", methods=["POST"])
@@ -266,6 +213,11 @@ def clean():
     threshold = int(data.get("threshold", 0))
     erode_px = int(data.get("erode", 0))
     keyline_px = int(data.get("keyline", 0))
+    try:
+        bbox_alpha_threshold = int(data.get("bbox_alpha_threshold", 16))
+    except Exception:
+        bbox_alpha_threshold = 16
+    bbox_alpha_threshold = min(max(bbox_alpha_threshold, 1), 64)
 
     multi_output = bool(data.get("multi_output", False))
     outputs = data.get("outputs") or {}
@@ -301,7 +253,7 @@ def clean():
     if not multi_output:
         product_key = (data.get("product_key") or "tshirt_classic").strip()
         profile = data.get("profile") or DEFAULT_PROFILES.get(product_key) or DEFAULT_PROFILES["tshirt_classic"]
-        img = _fit_artwork_to_product_canvas(base, profile)
+        img = _fit_artwork_to_product_canvas(base, profile, alpha_threshold=bbox_alpha_threshold)
         if scale and scale != 1.0:
             tw, th = round(img.width * scale), round(img.height * scale)
             tw, th = _fit_within(tw, th, MAX_OUTPUT_PX)
@@ -323,7 +275,7 @@ def clean():
         if isinstance(raw_profile, dict):
             merged.update(raw_profile)
 
-        img = _fit_artwork_to_product_canvas(base, merged)
+        img = _fit_artwork_to_product_canvas(base, merged, alpha_threshold=bbox_alpha_threshold)
 
         if scale and scale != 1.0:
             tw, th = round(img.width * scale), round(img.height * scale)
