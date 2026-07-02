@@ -1,6 +1,7 @@
 """
-padel-alpha-clean (v19 - adds /personalize endpoint for name personalization)
+padel-alpha-clean (v20 - /personalize + /mockup_badge for personalized preview mockups)
 -------------------------------------------------------
+NEW in v20: POST /mockup_badge proxies the mockup renderer and overlays ADD YOUR NAME badge
 NEW in v19: POST /personalize
   Draws a customer name into the reserved empty name zone of a __pname design
   (zone defined relative to the artwork alpha bounding box, lower area).
@@ -54,7 +55,7 @@ import requests
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 Image.MAX_IMAGE_PIXELS = None
@@ -455,9 +456,114 @@ def personalize():
     return jsonify(result)
 
 
+
+# ---------------------------------------------------------------------------
+# /mockup_badge — v20
+# ---------------------------------------------------------------------------
+def _draw_badge(img, text="ADD YOUR NAME", position="top_right"):
+    """Draw a clean Etsy-style badge on a final mockup image."""
+    text = (text or "").strip()
+    if not text:
+        return img
+
+    img = img.convert("RGBA")
+    w, h = img.size
+    draw = ImageDraw.Draw(img, "RGBA")
+
+    # Responsive sizing.
+    margin = max(18, int(min(w, h) * 0.035))
+    pad_x = max(18, int(w * 0.018))
+    pad_y = max(10, int(h * 0.012))
+    radius = max(12, int(min(w, h) * 0.018))
+    font_size = max(28, int(min(w, h) * 0.035))
+
+    try:
+        font_path = _get_font_path("archivo")
+        font = _load_sized_font(font_path, font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    text = text.upper()
+    l, t, r, b = draw.textbbox((0, 0), text, font=font)
+    tw, th = r - l, b - t
+    bw = tw + pad_x * 2
+    bh = th + pad_y * 2
+
+    pos = (position or "top_right").strip().lower()
+    if pos == "top_left":
+        x0, y0 = margin, margin
+    elif pos == "bottom_right":
+        x0, y0 = w - bw - margin, h - bh - margin
+    elif pos == "bottom_left":
+        x0, y0 = margin, h - bh - margin
+    else:
+        x0, y0 = w - bw - margin, margin
+    x1, y1 = x0 + bw, y0 + bh
+
+    # Subtle shadow + dark badge with white text.
+    shadow = max(2, int(min(w, h) * 0.004))
+    draw.rounded_rectangle((x0 + shadow, y0 + shadow, x1 + shadow, y1 + shadow), radius=radius, fill=(0, 0, 0, 65))
+    draw.rounded_rectangle((x0, y0, x1, y1), radius=radius, fill=(20, 20, 20, 225))
+    tx = x0 + pad_x - l
+    ty = y0 + pad_y - t
+    draw.text((tx, ty), text, font=font, fill=(255, 255, 255, 255))
+    return img
+
+
+@app.route("/mockup_badge", methods=["POST"])
+def mockup_badge():
+    """
+    Proxy to mockup-vg4o /render, then optionally overlay a badge.
+
+    Accepts the same JSON body as mockup-vg4o /render plus optional:
+      badge_text: "ADD YOUR NAME" or empty string
+      badge_position: top_right|top_left|bottom_right|bottom_left
+      render_url: override renderer URL
+      output: png|jpg
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    badge_text = (data.pop("badge_text", "") or "").strip()
+    badge_position = data.pop("badge_position", "top_right")
+    output = (data.pop("output", "jpg") or "jpg").strip().lower()
+    render_url = data.pop("render_url", "https://mockup-vg4o.onrender.com/render")
+
+    # Ensure the proxied renderer returns an image.
+    data["return_image"] = True
+
+    try:
+        rr = requests.post(render_url, json=data, timeout=int(data.get("timeout", 180)) if isinstance(data.get("timeout"), int) else 180)
+        rr.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": f"mockup renderer falhou: {e}"}), 502
+
+    try:
+        img = Image.open(io.BytesIO(rr.content)).convert("RGBA")
+    except Exception as e:
+        return jsonify({"error": f"abrir mockup render falhou: {e}"}), 422
+    finally:
+        rr = None
+        gc.collect()
+
+    if badge_text:
+        img = _draw_badge(img, badge_text, badge_position)
+
+    buf = io.BytesIO()
+    if output in ("jpg", "jpeg"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.getchannel("A"))
+        bg.save(buf, format="JPEG", quality=94, optimize=True)
+        mimetype = "image/jpeg"
+    else:
+        img.save(buf, format="PNG", optimize=False, compress_level=4)
+        mimetype = "image/png"
+    buf.seek(0)
+    img = None
+    gc.collect()
+    return send_file(buf, mimetype=mimetype)
+
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 19})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 20})
 
 
 @app.route("/clean", methods=["POST"])
