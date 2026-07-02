@@ -1,5 +1,25 @@
 """
-padel-alpha-clean (v18 - faster parallel ImgBB uploads + timeout-safe /clean)
+padel-alpha-clean (v19 - adds /personalize endpoint for name personalization)
+-------------------------------------------------------
+NEW in v19: POST /personalize
+  Draws a customer name into the reserved empty name zone of a __pname design
+  (zone defined relative to the artwork alpha bounding box, lower area).
+  Auto-fits font size, auto-detects dominant artwork ink colour when no colour
+  is provided, uploads result to ImgBB and returns the final print URL.
+
+Recommended /personalize body:
+{
+  "url": "https://...print.png",       # per-product print PNG (from PADEL_LOG col F)
+  "imgbb_key": "...",
+  "name": "MIGUEL",
+  "font": "bebas",                      # preset (bebas|archivo|oswald) or direct TTF URL
+  "color": "",                          # optional #RRGGBB; empty = auto dominant ink
+  "zone": {                             # optional, relative to artwork bbox
+    "y_top_pct": 82, "y_bottom_pct": 95, "width_pct": 68
+  },
+  "uppercase": true,
+  "max_chars": 18
+}
 -------------------------------------------------------
 This version solves Gelato size/cropping problems by returning a different
 transparent PNG per product/template.
@@ -221,9 +241,223 @@ def _apply_alpha_ops(img, threshold=0, erode_px=0, keyline_px=0):
     return out
 
 
+# ---------------------------------------------------------------------------
+# /personalize — v19
+# ---------------------------------------------------------------------------
+import os
+import re
+import unicodedata
+from PIL import ImageDraw, ImageFont
+
+FONT_PRESETS = {
+    "bebas": "https://raw.githubusercontent.com/google/fonts/main/ofl/bebasneue/BebasNeue-Regular.ttf",
+    "archivo": "https://raw.githubusercontent.com/google/fonts/main/ofl/archivoblack/ArchivoBlack-Regular.ttf",
+    "oswald": "https://raw.githubusercontent.com/google/fonts/main/ofl/oswald/Oswald%5Bwght%5D.ttf",
+}
+_FONT_CACHE_DIR = "/tmp/pname_fonts"
+_FALLBACK_FONTS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+]
+
+_NAME_ALLOWED = re.compile(r"[^A-Za-zÀ-ÖØ-öø-ÿ0-9 '\-\.&]")
+
+
+def _sanitize_name(raw, uppercase=True, max_chars=18):
+    if not raw:
+        return ""
+    s = unicodedata.normalize("NFC", str(raw))
+    s = _NAME_ALLOWED.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if uppercase:
+        s = s.upper()
+    return s[: max(1, int(max_chars))].strip()
+
+
+def _get_font_path(font_param):
+    """Resolve preset name or direct URL to a local TTF path (cached in /tmp)."""
+    font_param = (font_param or "bebas").strip()
+    url = FONT_PRESETS.get(font_param.lower(), font_param)
+    if not url.lower().startswith("http"):
+        url = FONT_PRESETS["bebas"]
+    os.makedirs(_FONT_CACHE_DIR, exist_ok=True)
+    fname = re.sub(r"[^A-Za-z0-9_.-]", "_", url.split("/")[-1]) or "font.ttf"
+    path = os.path.join(_FONT_CACHE_DIR, fname)
+    if not os.path.exists(path) or os.path.getsize(path) < 1000:
+        try:
+            fr = requests.get(url, timeout=60)
+            fr.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(fr.content)
+        except Exception:
+            for fb in _FALLBACK_FONTS:
+                if os.path.exists(fb):
+                    return fb
+            raise
+    return path
+
+
+def _hex_to_rgb(hex_str):
+    s = (hex_str or "").strip().lstrip("#")
+    if len(s) == 3:
+        s = "".join(c * 2 for c in s)
+    if len(s) != 6:
+        return None
+    try:
+        return tuple(int(s[i : i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return None
+
+
+def _dominant_ink(img, bbox, alpha_min=200):
+    """Most frequent quantised opaque colour inside the artwork bbox."""
+    left, top, right, bottom = bbox
+    art = img.crop((left, top, right, bottom))
+    if max(art.size) > 160:
+        art.thumbnail((160, 160), Image.LANCZOS)
+    arr = np.asarray(art)
+    mask = arr[:, :, 3] >= alpha_min
+    if not mask.any():
+        return (26, 26, 26)
+    rgb = arr[:, :, :3][mask]
+    q = (rgb // 24) * 24  # quantise to merge near-identical shades
+    colors, counts = np.unique(q.reshape(-1, 3), axis=0, return_counts=True)
+    best = colors[counts.argmax()]
+    return tuple(int(min(v + 12, 255)) for v in best)  # centre of the bucket
+
+
+def _load_sized_font(font_path, size):
+    f = ImageFont.truetype(font_path, size=max(8, int(size)))
+    # Variable fonts (e.g. Oswald[wght]) — pick a solid weight if supported.
+    try:
+        f.set_variation_by_axes([600])
+    except Exception:
+        pass
+    return f
+
+
+def _fit_text_font(draw, text, font_path, max_w, max_h):
+    """Binary-search the largest font size whose rendered text fits max_w x max_h."""
+    lo, hi, best = 8, int(max_h * 2.2) + 8, None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = _load_sized_font(font_path, mid)
+        l, t, r, b = draw.textbbox((0, 0), text, font=font)
+        w, h = r - l, b - t
+        if w <= max_w and h <= max_h:
+            best = (font, l, t, w, h)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        font = _load_sized_font(font_path, 8)
+        l, t, r, b = draw.textbbox((0, 0), text, font=font)
+        best = (font, l, t, r - l, b - t)
+    return best
+
+
+@app.route("/personalize", methods=["POST"])
+def personalize():
+    data = request.get_json(force=True, silent=True) or {}
+
+    url = data.get("url")
+    imgbb_key = data.get("imgbb_key")
+    raw_name = data.get("name", "")
+    uppercase = bool(data.get("uppercase", True))
+    max_chars = int(data.get("max_chars", 18))
+
+    name = _sanitize_name(raw_name, uppercase=uppercase, max_chars=max_chars)
+    if not url or not imgbb_key:
+        return jsonify({"error": "faltam 'url' e/ou 'imgbb_key'"}), 400
+    if not name:
+        return jsonify({"error": "'name' vazio ou invalido apos sanitizacao"}), 400
+
+    zone = data.get("zone") or {}
+    try:
+        y_top_pct = float(zone.get("y_top_pct", 82))
+        y_bottom_pct = float(zone.get("y_bottom_pct", 95))
+        width_pct = float(zone.get("width_pct", 68))
+    except Exception:
+        y_top_pct, y_bottom_pct, width_pct = 82.0, 95.0, 68.0
+    y_top_pct = min(max(y_top_pct, 50), 97)
+    y_bottom_pct = min(max(y_bottom_pct, y_top_pct + 3), 99)
+    width_pct = min(max(width_pct, 20), 95)
+
+    try:
+        bbox_alpha_threshold = int(data.get("bbox_alpha_threshold", 16))
+    except Exception:
+        bbox_alpha_threshold = 16
+    bbox_alpha_threshold = min(max(bbox_alpha_threshold, 1), 64)
+
+    # --- download base print PNG ---
+    try:
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({"error": f"download falhou: {e}"}), 502
+
+    try:
+        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+    except Exception as e:
+        return jsonify({"error": f"abrir imagem falhou: {e}"}), 422
+    finally:
+        r = None
+        gc.collect()
+
+    bbox = _alpha_bbox(img, alpha_threshold=bbox_alpha_threshold)
+    if bbox is None:
+        return jsonify({"error": "imagem sem artwork visivel (alpha vazio)"}), 422
+    left, top, right, bottom = bbox
+    art_w = right - left
+    art_h = bottom - top
+
+    # --- resolve colour ---
+    color = _hex_to_rgb(data.get("color"))
+    color_source = "param"
+    if color is None:
+        color = _dominant_ink(img, bbox)
+        color_source = "auto_dominant"
+
+    # --- resolve font ---
+    try:
+        font_path = _get_font_path(data.get("font"))
+    except Exception as e:
+        return jsonify({"error": f"font indisponivel: {e}"}), 502
+
+    # --- name zone in absolute pixels (relative to artwork bbox) ---
+    zone_x0 = left + round(art_w * (1 - width_pct / 100.0) / 2.0)
+    zone_x1 = right - round(art_w * (1 - width_pct / 100.0) / 2.0)
+    zone_y0 = top + round(art_h * y_top_pct / 100.0)
+    zone_y1 = top + round(art_h * y_bottom_pct / 100.0)
+    zone_w = max(1, zone_x1 - zone_x0)
+    zone_h = max(1, zone_y1 - zone_y0)
+
+    draw = ImageDraw.Draw(img)
+    font, off_l, off_t, text_w, text_h = _fit_text_font(draw, name, font_path, zone_w, zone_h)
+
+    tx = zone_x0 + (zone_w - text_w) // 2 - off_l
+    ty = zone_y0 + (zone_h - text_h) // 2 - off_t
+    draw.text((tx, ty), name, font=font, fill=color + (255,))
+
+    out_url = _upload_imgbb(img, imgbb_key, filename=f"pname_{name.replace(' ', '_')}.png")
+
+    result = {
+        "url": out_url,
+        "name_rendered": name,
+        "color_used": "#%02x%02x%02x" % color,
+        "color_source": color_source,
+        "font_px": font.size,
+        "zone_px": {"x0": zone_x0, "y0": zone_y0, "x1": zone_x1, "y1": zone_y1},
+        "artwork_bbox": {"left": left, "top": top, "right": right, "bottom": bottom},
+    }
+    img = None
+    gc.collect()
+    return jsonify(result)
+
+
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 18})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 19})
 
 
 @app.route("/clean", methods=["POST"])
